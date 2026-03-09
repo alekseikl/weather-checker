@@ -1,25 +1,44 @@
 use std::sync::Arc;
 
-use futures_lite::StreamExt;
+use anyhow::bail;
+use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
+
 use lapin::{
     BasicProperties, Channel, Connection,
+    message::Delivery,
     options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions},
     types::FieldTable,
 };
-use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 
-use crate::load_locations;
+use crate::checker::Checker;
 
 const QUEUE_NAME: &str = "weather-rpc";
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcRequest {
+    method: String,
+    arguments: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", content = "data", rename_all = "kebab-case")]
+enum RpcResult {
+    Ok(serde_json::Value),
+    Error(String),
+}
+
 pub struct Rpc {
     channel: Channel,
-    pool: PgPool,
+    checker: Arc<Checker>,
+    backpressure_sem: Arc<Semaphore>,
 }
 
 impl Rpc {
-    pub async fn new(connection: &Connection, pool: PgPool) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(connection: &Connection, checker: Arc<Checker>) -> anyhow::Result<Arc<Self>> {
         let channel = connection.create_channel().await?;
 
         channel
@@ -30,10 +49,88 @@ impl Rpc {
             )
             .await?;
 
-        Ok(Arc::new(Self { channel, pool }))
+        Ok(Arc::new(Self {
+            channel,
+            checker,
+            backpressure_sem: Arc::new(Semaphore::new(8)),
+        }))
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    async fn get_location(&self, args: serde_json::Value) -> anyhow::Result<RpcResult> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            location_id: i32,
+        }
+
+        let args: Args = serde_json::from_value(args)?;
+
+        match self.checker.load_location(args.location_id).await? {
+            Some(location) => Ok(RpcResult::Ok(serde_json::to_value(&location)?)),
+            None => Ok(RpcResult::Error("Location not found".into())),
+        }
+    }
+
+    async fn get_locations(&self, _args: serde_json::Value) -> anyhow::Result<RpcResult> {
+        let locations = self.checker.load_locations().await?;
+
+        Ok(RpcResult::Ok(serde_json::to_value(&locations)?))
+    }
+
+    async fn execute_request(&self, request: RpcRequest) -> anyhow::Result<serde_json::Value> {
+        let args = request.arguments;
+
+        info!(method = %request.method, "RPC method call");
+
+        let result = match request.method.as_str() {
+            "get-location" => self.get_location(args).await?,
+            "get-locations" => self.get_locations(args).await?,
+            _ => RpcResult::Error("Method not found".into()),
+        };
+
+        Ok(serde_json::to_value(&result)?)
+    }
+
+    pub async fn process_delivery(&self, delivery: Delivery) -> anyhow::Result<()> {
+        let (Some(reply_to), Some(correlation_id)) = (
+            delivery.properties.reply_to(),
+            delivery.properties.correlation_id(),
+        ) else {
+            error!("Missing reply_to/correlation_id in RPC request");
+            delivery.ack(BasicAckOptions::default()).await?;
+            bail!("Bad request");
+        };
+
+        let request: RpcRequest = match serde_json::from_slice(&delivery.data) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to deserialize RPC request: {}", e);
+                delivery.ack(BasicAckOptions::default()).await?;
+                bail!("Bad request");
+            }
+        };
+
+        let response = self.execute_request(request).await?;
+
+        self.channel
+            .basic_publish(
+                "".into(),
+                reply_to.clone(),
+                BasicPublishOptions::default(),
+                &serde_json::to_vec(&response).unwrap_or_default(),
+                BasicProperties::default()
+                    .with_correlation_id(correlation_id.clone())
+                    .with_content_type("application/json".into()),
+            )
+            .await?
+            .await?;
+
+        delivery.ack(BasicAckOptions::default()).await?;
+
+        Ok(())
+    }
+
+    pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
         let consumer = self
             .channel
             .basic_consume(
@@ -57,37 +154,16 @@ impl Rpc {
                 }
             };
 
-            let (Some(reply_to), Some(correlation_id)) = (
-                delivery.properties.reply_to(),
-                delivery.properties.correlation_id(),
-            ) else {
-                error!("Missing reply_to/correlation_id in RPC request");
-                delivery.ack(BasicAckOptions::default()).await?;
-                continue;
-            };
+            let rpc = self.clone();
+            let permit = self.backpressure_sem.clone().acquire_owned().await.unwrap();
 
-            let response = match load_locations(&self.pool).await {
-                Ok(locations) => serde_json::to_vec(&locations).unwrap_or_default(),
-                Err(e) => {
-                    let err = serde_json::json!({ "error": e.to_string() });
-                    serde_json::to_vec(&err).unwrap_or_default()
+            tokio::spawn(async move {
+                if let Err(error) = rpc.process_delivery(delivery).await {
+                    error!("Error processing delivery: {}", error);
                 }
-            };
 
-            self.channel
-                .basic_publish(
-                    "".into(),
-                    reply_to.clone(),
-                    BasicPublishOptions::default(),
-                    &response,
-                    BasicProperties::default()
-                        .with_correlation_id(correlation_id.clone())
-                        .with_content_type("application/json".into()),
-                )
-                .await?
-                .await?;
-
-            delivery.ack(BasicAckOptions::default()).await?;
+                drop(permit);
+            });
         }
 
         Ok(())

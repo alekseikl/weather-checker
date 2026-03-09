@@ -7,7 +7,7 @@ use lapin::{
 };
 use serde::Serialize;
 
-use crate::Location;
+use crate::checker::Location;
 
 const EXCHANGE_NAME: &str = "weather.events";
 

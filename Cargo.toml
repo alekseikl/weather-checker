@@ -14,5 +14,5 @@ tracing-subscriber = "0.3.22"
 chrono = { version = "0.4.44", features = ["serde"] }
 lapin = "4.1.1"
 async-rs = "0.8.0"
-futures-lite = "2.6.1"
 anyhow = "1.0.102"
+tokio-stream = "0.1.18"
