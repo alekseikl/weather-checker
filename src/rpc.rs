@@ -77,7 +77,15 @@ impl Rpc {
         Ok(RpcResult::Ok(serde_json::to_value(&locations)?))
     }
 
-    async fn execute_request(&self, request: RpcRequest) -> anyhow::Result<serde_json::Value> {
+    async fn execute_request(&self, request_data: &[u8]) -> anyhow::Result<serde_json::Value> {
+        let request: RpcRequest = match serde_json::from_slice(request_data) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to deserialize RPC request: {}", e);
+                bail!("Bad request");
+            }
+        };
+
         let args = request.arguments;
 
         info!(method = %request.method, "RPC method call");
@@ -88,7 +96,7 @@ impl Rpc {
             _ => RpcResult::Error("Method not found".into()),
         };
 
-        Ok(serde_json::to_value(&result)?)
+        Ok(serde_json::to_value(result)?)
     }
 
     pub async fn process_delivery(&self, delivery: Delivery) -> anyhow::Result<()> {
@@ -101,16 +109,10 @@ impl Rpc {
             bail!("Bad request");
         };
 
-        let request: RpcRequest = match serde_json::from_slice(&delivery.data) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to deserialize RPC request: {}", e);
-                delivery.ack(BasicAckOptions::default()).await?;
-                bail!("Bad request");
-            }
+        let response = match self.execute_request(&delivery.data).await {
+            Ok(value) => value,
+            Err(_) => serde_json::to_value(RpcResult::Error("Bad request".into()))?,
         };
-
-        let response = self.execute_request(request).await?;
 
         self.channel
             .basic_publish(
