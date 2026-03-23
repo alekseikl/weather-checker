@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use sqlx::{PgPool, postgres::types::PgPoint};
-use tokio::time;
+use tokio::{sync::broadcast, time};
 use tracing::{info, warn};
 
 use crate::notifier::Notifier;
@@ -21,6 +21,7 @@ fn serialize_pg_point<S: serde::Serializer>(
 }
 
 #[derive(sqlx::FromRow, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Location {
     pub id: i32,
     pub name: String,
@@ -137,26 +138,33 @@ impl Checker {
         Ok(())
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&self, mut shutdown_rx: broadcast::Receiver<()>) -> anyhow::Result<()> {
         let mut failure_counter = 0usize;
 
-        loop {
-            match self.check_weather().await {
-                Result::Ok(_) => {
-                    failure_counter = 0;
-                    info!("Check succeeded");
+        let run_loop = async {
+            loop {
+                match self.check_weather().await {
+                    Result::Ok(_) => {
+                        failure_counter = 0;
+                        info!("Check succeeded");
+                    }
+                    Result::Err(error) => {
+                        failure_counter += 1;
+                        warn!("Check failed: {}", error);
+                    }
                 }
-                Result::Err(error) => {
-                    failure_counter += 1;
-                    warn!("Check failed: {}", error);
+
+                if failure_counter > 5 {
+                    break anyhow!("Failure count reached.");
                 }
-            }
 
-            if failure_counter > 5 {
-                bail!("Failure count reached.");
+                time::sleep(std::time::Duration::from_secs(60)).await;
             }
+        };
 
-            time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::select! {
+            error = run_loop => Err(error),
+            _ = shutdown_rx.recv() => Ok(())
         }
     }
 }

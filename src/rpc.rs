@@ -10,12 +10,13 @@ use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions},
     types::FieldTable,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, broadcast};
 use tracing::{error, info};
 
 use crate::checker::Checker;
 
 const QUEUE_NAME: &str = "weather-rpc";
+const MAX_CONCURRENT_REQUESTS: u32 = 8;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +53,7 @@ impl Rpc {
         Ok(Arc::new(Self {
             channel,
             checker,
-            backpressure_sem: Arc::new(Semaphore::new(8)),
+            backpressure_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS as usize)),
         }))
     }
 
@@ -132,7 +133,10 @@ impl Rpc {
         Ok(())
     }
 
-    pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
+    pub async fn run(
+        self: &Arc<Self>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> anyhow::Result<()> {
         let consumer = self
             .channel
             .basic_consume(
@@ -147,26 +151,38 @@ impl Rpc {
 
         tokio::pin!(consumer);
 
-        while let Some(delivery) = consumer.next().await {
-            let delivery = match delivery {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("Error receiving delivery: {}", e);
-                    continue;
-                }
-            };
+        let run_loop = async {
+            while let Some(delivery) = consumer.next().await {
+                let delivery = match delivery {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!("Error receiving delivery: {}", e);
+                        continue;
+                    }
+                };
 
-            let rpc = self.clone();
-            let permit = self.backpressure_sem.clone().acquire_owned().await.unwrap();
+                let rpc = self.clone();
+                let permit = self.backpressure_sem.clone().acquire_owned().await.unwrap();
 
-            tokio::spawn(async move {
-                if let Err(error) = rpc.process_delivery(delivery).await {
-                    error!("Error processing delivery: {}", error);
-                }
+                tokio::spawn(async move {
+                    if let Err(error) = rpc.process_delivery(delivery).await {
+                        error!("Error processing delivery: {}", error);
+                    }
 
-                drop(permit);
-            });
+                    drop(permit);
+                });
+            }
+        };
+
+        tokio::select! {
+            _ = run_loop => {},
+            _ = shutdown_rx.recv() => {}
         }
+
+        let _ = self
+            .backpressure_sem
+            .acquire_many(MAX_CONCURRENT_REQUESTS)
+            .await;
 
         Ok(())
     }
